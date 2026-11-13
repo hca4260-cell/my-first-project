@@ -1,0 +1,1708 @@
+mother_field_model
+
+#!/usr/bin/env python3
+"""
+母场玩具模型（统一程序）
+
+把此前分散在 mother_field_toy_v2.py（基础）与 mother_field_exp_*.py（实验）里的已定内容合并为一个程序：
+  - 整体约束不可分摊 默认开启（inherit=True）：经由整体建立的关系（xrel）由两个子部分各自保留；
+    区分关系与其余关系仍可分摊。inherit=False 即此前基础程序 v2 的"可分摊"模式，作对照。
+  - 【选项B·阶段2】B2 推荐主通道 = 三形式（star_m=5, dens_theta=0.35）默认开启；
+    p_link 默认 0（随机跨谱系为可选增强，不再作为质变主源泉）。
+  - 选择原则作为参数 select：random（随机）/ min（最小改动）/ max（最大改动，反向对照）。
+  - 重组的再分化深度作为参数 max_resplit_depth：1 = 一次再分化，枚举完备；
+    2 = 先一次，找不到再试两次，搜索有上限（resplit_search_cap），"没找到"不等于"无解"。
+  - 消散有显式失败路径（RuntimeError）；初始化检查配额可行性（ValueError）。
+
+内核与代码的对应
+  整体   State：部分、关系、约束、整体关系、性质数 k、配额 alpha；初始只有 1 个部分
+  变     World.change()：R1 一分为二（区分关系必带约束）；可选地以 p_link 经由整体新增跨谱系关系
+  自洽   consistent(st)：纯函数，完备回溯；是否存在使全部约束与整体配额共同成立的赋值
+  R2     关系是否带约束：一分为二的区分关系必带；经由整体的关系以 q_link 概率带（q_link=1 即全部都带；
+         q_link<1 只是敏感性探针）
+  R3     World.reorganize()：重组 / 转化 / 消散
+  R4     整体配额 alpha（替身，alpha=1.0 关闭）；整体关系由子部分继承（inherit）
+
+声明：这是一个随机图约束玩具模型。分裂、随机加边、配额、选择规则、改动的度量、增加性质数、删去关系，
+      都是人为规定的转移规则，不证明它们由母场必然推出，也不代表物理宇宙的生成机制。
+      步数下标只是依赖顺序的账本，不是时间。"整体关系 = 跨谱系关系"是替身。
+
+用法
+  python3 mother_field_model.py            运行自检（回归 v2 的验收数字 + 已定原则的检验）
+"""
+import itertools
+import math
+import random
+from collections import Counter
+
+
+# ------------------------------------------------------------------ 数据结构
+def edge(a, b):
+    return (a, b) if a < b else (b, a)
+
+
+class State:
+    def __init__(self, k=2, alpha=1.0):
+        self.rel = {0: set()}
+        self.cons = set()
+        self.xrel = set()
+        self.k = k
+        self.alpha = alpha
+
+    def copy(self):
+        g = State(self.k, self.alpha)
+        g.rel = {v: set(a) for v, a in self.rel.items()}
+        g.cons = set(self.cons)
+        g.xrel = set(self.xrel)
+        return g
+
+    def edges(self):
+        return sorted(edge(a, b) for a in self.rel for b in self.rel[a] if a < b)
+
+    def snapshot(self):
+        return (tuple(self.edges()), tuple(sorted(self.cons)),
+                tuple(sorted(self.xrel)), self.k, self.alpha)
+
+
+def quota(n, alpha):
+    return math.ceil(alpha * n - 1e-9)
+
+
+def is_forest(nodes, edges):
+    adj = {v: set() for v in nodes}
+    for a, b in edges:
+        adj[a].add(b)
+        adj[b].add(a)
+    seen = set()
+    for s in nodes:
+        if s in seen:
+            continue
+        seen.add(s)
+        stack = [(s, None)]
+        while stack:
+            v, par = stack.pop()
+            for u in adj[v]:
+                if u == par:
+                    continue
+                if u in seen:
+                    return False
+                seen.add(u)
+                stack.append((u, v))
+    return True
+
+
+def relation_is_tree(st):
+    return len(st.edges()) == len(st.rel) - 1 and is_forest(list(st.rel), st.edges())
+
+
+# ------------------------------------------------------------------ 自洽：筛选者（纯函数）
+def consistent(st):
+    """检查是否存在同时满足约束和整体配额的赋值；完备回溯搜索。"""
+    nodes = sorted(st.rel, key=lambda v: -len(st.rel[v]))
+    c = quota(len(nodes), st.alpha)
+    nb = {v: [u for u in st.rel[v] if edge(u, v) in st.cons] for v in st.rel}
+    col, counts = {}, [0] * st.k
+
+    def bt(i, used_max):
+        if i == len(nodes):
+            return True
+        v = nodes[i]
+        used = {col[u] for u in nb[v] if u in col}
+        for x in range(min(st.k, used_max + 2)):
+            if x in used or counts[x] >= c:
+                continue
+            col[v] = x
+            counts[x] += 1
+            if bt(i + 1, max(used_max, x)):
+                return True
+            counts[x] -= 1
+            del col[v]
+        return False
+
+    return bt(0, -1)
+
+
+def chromatic_number(st):
+    """只看约束（不看配额）所需的最少性质数。"""
+    k = 1
+    while True:
+        g = st.copy()
+        g.k, g.alpha = k, 1.0
+        if consistent(g):
+            return k
+        k += 1
+
+
+def min_k_of(st):
+    """残存图在 alpha=1 下的最小可行性质数。"""
+    return chromatic_number(st)
+
+
+def dissolve_step(st, rng, frac=0.10, prefer_xrel=True):
+    """拆除约 frac 比例的约束边；prefer_xrel 时优先拆整体关系边。"""
+    st = st.copy()
+    cons = list(st.cons)
+    if not cons:
+        return st, 0
+    if prefer_xrel:
+        pool = [e for e in cons if e in st.xrel] or cons
+    else:
+        pool = cons
+    n_rem = max(1, int(math.ceil(frac * len(cons))))
+    n_rem = min(n_rem, len(pool))
+    for a, b in rng.sample(pool, n_rem):
+        st.rel[a].discard(b)
+        st.rel[b].discard(a)
+        st.cons.discard(edge(a, b))
+        st.xrel.discard(edge(a, b))
+    return st, n_rem
+
+
+def hysteresis_trial(seed, p_link=0.5, target_k=5, max_n=45, frac=0.10,
+                     inherit=True, prefer_xrel=True):
+    """
+    正向建压至 k>=target_k 或 n>=max_n，再受控消散。
+    返回 dict: k_peak, cons_peak, n_peak, R2, R3, A_stub, fall_path, undamped
+    """
+    w = World(seed, alpha=1.0, p_link=p_link, q_link=1.0, inherit=inherit,
+              max_resplit_depth=1, policy="重组优先")
+    while w.st.k < target_k and len(w.st.rel) < max_n:
+        w.step()
+    k_peak = w.st.k
+    cons_peak = max(1, len(w.st.cons))
+    n_peak = len(w.st.rel)
+
+    st = w.st.copy()
+    rng = random.Random(seed + 9001)
+    path = [(1.0, min_k_of(st))]
+    while st.cons:
+        st, _ = dissolve_step(st, rng, frac=frac, prefer_xrel=prefer_xrel)
+        rho = len(st.cons) / cons_peak
+        path.append((rho, min_k_of(st)))
+    if path[-1][0] > 0:
+        path.append((0.0, min_k_of(st)))
+
+    def first_R(kappa_star):
+        for rho, mk in path:
+            if mk <= kappa_star:
+                return 1.0 - rho
+        return 1.0
+
+    R3 = first_R(3) if k_peak >= 3 else None
+    R2 = first_R(2)
+
+    A_fall = 0.0
+    for i in range(len(path) - 1):
+        rho1, mk1 = path[i]
+        rho2, mk2 = path[i + 1]
+        kap1 = mk1 / k_peak
+        kap2 = mk2 / k_peak
+        A_fall += 0.5 * (kap1 + kap2) * abs(rho1 - rho2)
+    A_stub = A_fall - 0.5 if k_peak >= 3 else None
+
+    return dict(
+        seed=seed, inherit=inherit, prefer_xrel=prefer_xrel,
+        k_peak=k_peak, cons_peak=cons_peak, n_peak=n_peak,
+        R2=R2, R3=R3, A_fall=A_fall, A_stub=A_stub, path=path,
+    )
+
+
+def _compute_fall_metrics(st0, rng, frac=0.10, prefer_xrel=True):
+    """从峰值状态消散，返回 R2、R3、A_stub、k_peak、cons_peak、path。"""
+    k_peak = st0.k
+    cons_peak = max(1, len(st0.cons))
+    st = st0.copy()
+    path = [(1.0, min_k_of(st))]
+    while st.cons:
+        st, _ = dissolve_step(st, rng, frac=frac, prefer_xrel=prefer_xrel)
+        path.append((len(st.cons) / cons_peak, min_k_of(st)))
+    if path[-1][0] > 0:
+        path.append((0.0, min_k_of(st)))
+
+    def first_R(kappa_star):
+        for rho, mk in path:
+            if mk <= kappa_star:
+                return 1.0 - rho
+        return 1.0
+
+    R3 = first_R(3) if k_peak >= 3 else None
+    R2 = first_R(2)
+    A_fall = 0.0
+    for i in range(len(path) - 1):
+        rho1, mk1 = path[i]
+        rho2, mk2 = path[i + 1]
+        A_fall += 0.5 * (mk1 / k_peak + mk2 / k_peak) * abs(rho1 - rho2)
+    A_stub = (A_fall - 0.5) if k_peak >= 3 else None
+    return dict(R2=R2, R3=R3, A_fall=A_fall, A_stub=A_stub,
+                k_peak=k_peak, cons_peak=cons_peak, path=path, st_after=st)
+
+
+def multi_cycle_tau(seed, n_cycles=3, p_link=0.55, max_n_per_cycle=28,
+                    frac=0.10, inherit=True, prefer_xrel=True, metric="R3"):
+    """多次「建压–消散」循环，累加 Δτ_cycle。"""
+    w = World(seed, alpha=1.0, p_link=p_link, q_link=1.0, inherit=inherit,
+              max_resplit_depth=1, policy="重组优先")
+    rng = random.Random(seed + 4242)
+    cycles = []
+    sum_tau = 0.0
+
+    for c in range(n_cycles):
+        n0 = len(w.st.rel)
+        k0 = w.st.k
+        target_k = max(4, k0 + 1) if c == 0 else max(k0 + 1, 3)
+        steps_guard = 0
+        max_steps = max_n_per_cycle + 10
+        while steps_guard < max_steps and len(w.st.rel) < n0 + max_n_per_cycle:
+            w.step()
+            steps_guard += 1
+            if w.st.k >= target_k:
+                break
+
+        met = _compute_fall_metrics(w.st, rng, frac=frac, prefer_xrel=prefer_xrel)
+        k_peak = met["k_peak"]
+        if metric == "A_stub":
+            dtau = max(met["A_stub"] or 0.0, 0.0) if k_peak >= 3 else 0.0
+        elif metric == "R2":
+            dtau = met["R2"] if k_peak >= 3 else 0.0
+        else:
+            if k_peak > 3 and met["R3"] is not None:
+                dtau = met["R3"]
+            elif k_peak >= 3:
+                dtau = met["R2"]
+            else:
+                dtau = 0.0
+
+        cycles.append(dict(
+            cycle=c + 1,
+            n_start=n0, n_peak=len(w.st.rel),
+            k_start=k0, k_peak=k_peak,
+            R3=met["R3"], R2=met["R2"], A_stub=met["A_stub"],
+            dtau=dtau,
+        ))
+        sum_tau += dtau
+
+        w.st = met["st_after"]
+        w.st.k = max(2, min_k_of(w.st))
+        w.nid = max(w.st.rel) + 1 if w.st.rel else 1
+        w._prev_edges = set(w.st.edges())
+
+    return dict(seed=seed, inherit=inherit, p_link=p_link, metric=metric,
+                cycles=cycles, sum_tau=sum_tau, n_cycles=n_cycles)
+
+
+# ------------------------------------------------------------------ 整体延续与扰动稳定性（验收 D）
+def edge_jaccard(a, b):
+    """集合相似度；空对空记为 1。"""
+    a, b = set(a), set(b)
+    if not a and not b:
+        return 1.0
+    u = a | b
+    return len(a & b) / len(u) if u else 1.0
+
+
+def continuity_check(st_prev, st_curr, jaccard_theta=0.3):
+    """检查根部分、部分集合包含关系及核心整体关系延续。"""
+    reasons = []
+    root_ok = 0 in st_curr.rel
+    if not root_ok:
+        reasons.append("根部分0缺失")
+    prev_nodes = set(st_prev.rel)
+    curr_nodes = set(st_curr.rel)
+    subset_ok = prev_nodes <= curr_nodes
+    if not subset_ok:
+        reasons.append("部分被删除")
+    jac = edge_jaccard(st_prev.xrel, st_curr.xrel)
+    core_ok = jac >= jaccard_theta or (not st_prev.xrel and not st_curr.xrel)
+    if not core_ok:
+        reasons.append(f"xrel Jaccard={jac:.2f}<{jaccard_theta}")
+    same = root_ok and subset_ok and core_ok
+    return dict(same_whole=same, root_ok=root_ok, subset_ok=subset_ok,
+                jaccard_xrel=jac, reasons=reasons)
+
+
+def apply_perturbation(st, rng, kind, alpha_shock=0.5):
+    """施加 edge_del、alpha 或 edge_add 扰动；不删除部分。"""
+    st = st.copy()
+    info = {"kind": kind}
+    if kind == "edge_del":
+        cons = list(st.cons)
+        if not cons:
+            info["n_del"] = 0
+            return st, info
+        n_del = min(len(cons), rng.randint(1, 3))
+        for a, b in rng.sample(cons, n_del):
+            st.rel[a].discard(b)
+            st.rel[b].discard(a)
+            st.cons.discard(edge(a, b))
+            st.xrel.discard(edge(a, b))
+        info["n_del"] = n_del
+    elif kind == "alpha":
+        info["alpha_before"] = st.alpha
+        st.alpha = min(st.alpha, alpha_shock)
+        info["alpha_after"] = st.alpha
+    elif kind == "edge_add":
+        nodes = list(st.rel)
+        added = False
+        rng.shuffle(nodes)
+        for i, a in enumerate(nodes):
+            for b in nodes[i + 1:]:
+                e = edge(a, b)
+                if e not in st.rel[a] and e not in st.cons:
+                    st.rel[a].add(b)
+                    st.rel[b].add(a)
+                    st.cons.add(e)
+                    st.xrel.add(e)
+                    info["edge"] = e
+                    added = True
+                    break
+            if added:
+                break
+        info["added"] = added
+    else:
+        raise ValueError(kind)
+    return st, info
+
+
+def recover_state(w, max_rounds=8):
+    """扰动后仅用重组/转化恢复自洽，不继续 change。"""
+    rounds = 0
+    while not w.is_consistent() and rounds < max_rounds:
+        w.reorganize()
+        rounds += 1
+    return w.is_consistent(), rounds
+
+def stability_grade(st_before, w_after):
+    """
+    强稳定：快照完全一致（边/约束/xrel/k/alpha）
+    等价稳定：自洽且 k 相同且 xrel Jaccard≥0.8
+    弱稳定：仅自洽
+    未恢复：仍不自洽
+    """
+    if not w_after.is_consistent():
+        return "未恢复"
+    st = w_after.st
+    if (st.snapshot() == st_before.snapshot()):
+        return "强稳定"
+    jac = edge_jaccard(st_before.xrel, st.xrel)
+    if st.k == st_before.k and jac >= 0.8:
+        return "等价稳定"
+    return "弱稳定"
+
+
+def continuity_trial(seed, steps=16, p_link=0.3, jaccard_theta=0.3):
+    """正向演化，逐步检查与上一步的延续性；末尾强消散后再检查。"""
+    w = World(seed, alpha=1.0, p_link=p_link, q_link=1.0, inherit=True,
+              max_resplit_depth=1, policy="重组优先")
+    flags = []
+    prev = w.st.copy()
+    for _ in range(steps):
+        w.step()
+        flags.append(continuity_check(prev, w.st, jaccard_theta))
+        prev = w.st.copy()
+    st = w.st.copy()
+    for a, b in list(st.cons):
+        st.rel[a].discard(b)
+        st.rel[b].discard(a)
+        st.cons.discard(edge(a, b))
+        st.xrel.discard(edge(a, b))
+    after_diss = continuity_check(prev, st, jaccard_theta)
+    return dict(
+        seed=seed,
+        step_same=sum(1 for f in flags if f["same_whole"]),
+        step_total=len(flags),
+        after_dissolve=after_diss,
+        final_n=len(w.st.rel),
+    )
+
+
+def perturbation_trial(seed, kind, grow_steps=12, p_link=0.35, max_recover=8):
+    """建压若干步 → 扰动 → 恢复 → 分级。"""
+    w = World(seed, alpha=1.0, p_link=p_link, q_link=1.0, inherit=True,
+              max_resplit_depth=1, policy="重组优先")
+    for _ in range(grow_steps):
+        w.step()
+    before = w.st.copy()
+    if not w.is_consistent():
+        w.reorganize()
+        before = w.st.copy()
+    rng = random.Random(seed + 777)
+    st_p, info = apply_perturbation(before, rng, kind)
+    w.st = st_p
+    w.nid = max(w.st.rel) + 1 if w.st.rel else 1
+    w._prev_edges = set(w.st.edges())
+    ok, rounds = recover_state(w, max_rounds=max_recover)
+    grade = stability_grade(before, w)
+    cont = continuity_check(before, w.st)
+    return dict(
+        seed=seed, kind=kind, grade=grade, recovered=ok, rounds=rounds,
+        same_whole=cont["same_whole"], info=info,
+        k_before=before.k, k_after=w.st.k,
+    )
+
+
+# ------------------------------------------------------------------ R1：一分为二
+def split(st, v, side, new, inherit):
+    """v 一分为二。side[u]==1 的邻居（连同其约束）改挂到新部分；两个子部分互相区分，该关系必带约束。
+    inherit=True：经由整体建立的关系不被分摊，两个子部分都保留。"""
+    g = st.copy()
+    g.rel[new] = set()
+    for u, s in side.items():
+        e_old = edge(u, v)
+        is_x = e_old in g.xrel
+        had = e_old in g.cons
+        if inherit and is_x:
+            ne = edge(u, new)
+            g.rel[new].add(u)
+            g.rel[u].add(new)
+            if had:
+                g.cons.add(ne)
+            g.xrel.add(ne)
+            continue
+        if s:
+            g.rel[v].discard(u)
+            g.rel[u].discard(v)
+            g.cons.discard(e_old)
+            g.xrel.discard(e_old)
+            ne = edge(u, new)
+            g.rel[new].add(u)
+            g.rel[u].add(new)
+            if had:
+                g.cons.add(ne)
+            if is_x:
+                g.xrel.add(ne)
+    g.rel[v].add(new)
+    g.rel[new].add(v)
+    g.cons.add(edge(v, new))
+    return g
+
+
+def candidates(st, inherit):
+    """"变"能给出的全部一次再分化方式。inherit 时，整体关系的邻居不需要分配，只枚举可分摊的邻居。
+    全部移走与全部留下同构，只留一种。"""
+    for v in sorted(st.rel):
+        free = [u for u in sorted(st.rel[v]) if not (inherit and edge(u, v) in st.xrel)]
+        for mask in range(2 ** len(free)):
+            side = {u: (mask >> i) & 1 for i, u in enumerate(free)}
+            if free and all(side.values()):
+                continue
+            for u in st.rel[v]:
+                side.setdefault(u, 0)
+            yield v, side
+
+
+def split_cost(st, v, side, inherit):
+    """一次再分化的改动 = 新增的部分(1) + 区分关系(1) + 被分摊的关系(每条删 1 增 1) + 被复制的整体关系(每条增 1)。
+    只数被改动的结构单元，不预设取值向量，也不预设能量。"""
+    moved = sum(1 for u, s in side.items() if s and not (inherit and edge(u, v) in st.xrel))
+    copied = sum(1 for u in st.rel[v] if inherit and edge(u, v) in st.xrel)
+    return 2 + 2 * moved + copied
+
+# ------------------------------------------------------------------ 世界
+
+# ------------------------------------------------------------------ 整体约束三形式（第20节标定）
+def density_of_block(st, nodes):
+    nodes = set(nodes)
+    if len(nodes) < 2:
+        return 0.0
+    e = sum(1 for a in nodes for b in st.rel[a] if b in nodes and a < b)
+    n = len(nodes)
+    return 2.0 * e / (n * (n - 1))
+
+
+def connected_components(st):
+    seen, comps = set(), []
+    for s in st.rel:
+        if s in seen:
+            continue
+        stack = [s]
+        seen.add(s)
+        comp = []
+        while stack:
+            v = stack.pop()
+            comp.append(v)
+            for u in st.rel[v]:
+                if u not in seen:
+                    seen.add(u)
+                    stack.append(u)
+        comps.append(comp)
+    return comps
+
+
+def apply_synergy_star(st, m=5):
+    """多关系协同：deg(v)+1 >= m 时，星形边标为 xrel（不可分摊）且带约束。"""
+    st = st.copy()
+    for v in list(st.rel):
+        nbrs = list(st.rel[v])
+        if len(nbrs) + 1 < m:
+            continue
+        for u in nbrs:
+            e = edge(v, u)
+            st.xrel.add(e)
+            st.cons.add(e)
+    return st
+
+
+def apply_density_blocks(st, theta=0.35, min_size=6, only_new=None):
+    """网络结构：连通块 |C|>=min_size 且密度>theta 时，升格 only_new（或块内全部边）。"""
+    st = st.copy()
+    for comp in connected_components(st):
+        if len(comp) < min_size:
+            continue
+        if density_of_block(st, comp) <= theta:
+            continue
+        cs = set(comp)
+        edges = [edge(a, b) for a in comp for b in st.rel[a] if b in cs and a < b]
+        if only_new is not None:
+            edges = [e for e in edges if e in only_new]
+        for e in edges:
+            st.xrel.add(e)
+            st.cons.add(e)
+    return st
+
+
+def consistent_balanced(st, balance_slack=1):
+    """整体协调：配额 + 已用色类 max-min <= balance_slack。"""
+    nodes = sorted(st.rel, key=lambda v: -len(st.rel[v]))
+    c_cap = quota(len(nodes), st.alpha)
+    nb = {v: [u for u in st.rel[v] if edge(u, v) in st.cons] for v in st.rel}
+    col, counts = {}, [0] * st.k
+
+    def ok_balance():
+        used = [c for c in counts if c > 0]
+        return len(used) <= 1 or max(used) - min(used) <= balance_slack
+
+    def bt(i, used_max):
+        if i == len(nodes):
+            return ok_balance()
+        v = nodes[i]
+        used = {col[u] for u in nb[v] if u in col}
+        for x in range(min(st.k, used_max + 2)):
+            if x in used or counts[x] >= c_cap:
+                continue
+            col[v] = x
+            counts[x] += 1
+            if bt(i + 1, max(used_max, x)):
+                return True
+            counts[x] -= 1
+            del col[v]
+        return False
+
+    return bt(0, -1)
+
+
+class World:
+    def __init__(self, seed, policy="重组优先", alpha=1.0, p_link=0.0, q_link=1.0,
+                 inherit=True, select="random", max_resplit_depth=1, resplit_search_cap=3000,
+                 use_synergy=True, use_density=True, use_balance=False,
+                 star_m=5, dens_theta=0.35, dens_min_size=6, balance_slack=1):
+        if alpha * 2 < 1 - 1e-9:
+            raise ValueError("alpha 过小：k=2 时需要 alpha >= 1/2，否则没有任何约束时整体配额也无法满足")
+        if select not in ("random", "min", "max"):
+            raise ValueError("select 只能是 random / min / max")
+        self.rng = random.Random(seed)
+        self.st = State(2, alpha)
+        self.nid = 1
+        self.policy = policy
+        self.p_link = p_link
+        self.q_link = q_link
+        self.inherit = inherit
+        self.select = select
+        self.max_depth = max_resplit_depth
+        self.cap = resplit_search_cap
+        self.use_synergy = use_synergy
+        self.use_density = use_density
+        self.use_balance = use_balance
+        self.star_m = star_m
+        self.dens_theta = dens_theta
+        self.dens_min_size = dens_min_size
+        self.balance_slack = balance_slack
+        self._prev_edges = set(self.st.edges())
+        self.log = []
+        self.resolved = 0
+        self.forced = 0
+        self.cost_total = 0
+        self.sel_events = 0
+        self.tie_events = 0
+        self.parent = {0: None}
+        self.edge_events = []
+
+    # ----- 变：生成者 -----
+    def change(self):
+        st = self.st
+        v = self.rng.choice(sorted(st.rel))
+        side = {u: self.rng.randint(0, 1) for u in sorted(st.rel[v])}
+        new = self.nid
+        self.nid += 1
+        self.parent[new] = v
+        self.st = split(st, v, side, new, self.inherit)
+        self.edge_events.append(("C-R1", v, new))
+        if self.rng.random() < self.p_link:
+            others = [u for u in self.st.rel if u != new and u not in self.st.rel[new]]
+            if others:
+                u = self.rng.choice(others)
+                ne = edge(new, u)
+                self.st.rel[new].add(u)
+                self.st.rel[u].add(new)
+                self.st.xrel.add(ne)
+                if self.rng.random() < self.q_link:
+                    self.st.cons.add(ne)
+                self.edge_events.append(("C-pl", new, u))
+        self._apply_whole_forms()
+
+    def _apply_whole_forms(self):
+        """第20节：星形不可分摊、密度块只升新边。"""
+        new_edges = set(self.st.edges()) - self._prev_edges
+        xrel_before = set(self.st.xrel)
+        if self.use_synergy:
+            self.st = apply_synergy_star(self.st, self.star_m)
+            for e in self.st.xrel - xrel_before:
+                self.edge_events.append(("C-syn", e[0], e[1]))
+            xrel_before = set(self.st.xrel)
+        if self.use_density:
+            self.st = apply_density_blocks(
+                self.st, self.dens_theta, self.dens_min_size, only_new=new_edges)
+            for e in self.st.xrel - xrel_before:
+                self.edge_events.append(("C-den", e[0], e[1]))
+        self._prev_edges = set(self.st.edges())
+
+    def is_consistent(self):
+        if self.use_balance:
+            return consistent_balanced(self.st, self.balance_slack)
+        return consistent(self.st)
+
+    def _ok_state(self, st):
+        if self.use_balance:
+            return consistent_balanced(st, self.balance_slack)
+        return consistent(st)
+
+    # ----- R3 的三种结果 -----
+    def try_resplit(self):
+        """重组：候选由"变"给出（再分化），自洽只筛选。深度 1 枚举完备；深度 2 有搜索上限。"""
+        good = []
+        for v, side in candidates(self.st, self.inherit):
+            if self._ok_state(split(self.st, v, side, self.nid, self.inherit)):
+                good.append((split_cost(self.st, v, side, self.inherit), [(v, side)]))
+        depth = 1
+        if not good and self.max_depth >= 2:
+            depth = 2
+            lv1 = list(candidates(self.st, self.inherit))
+            self.rng.shuffle(lv1)
+            checks = 0
+            for v, side in lv1:
+                g1 = split(self.st, v, side, self.nid, self.inherit)
+                c1 = split_cost(self.st, v, side, self.inherit)
+                lv2 = list(candidates(g1, self.inherit))
+                self.rng.shuffle(lv2)
+                for v2, side2 in lv2:
+                    checks += 1
+                    if self._ok_state(split(g1, v2, side2, self.nid + 1, self.inherit)):
+                        good.append((c1 + split_cost(g1, v2, side2, self.inherit),
+                                     [(v, side), (v2, side2)]))
+                    if checks > self.cap or len(good) >= 10:
+                        break
+                if checks > self.cap or len(good) >= 10:
+                    break
+        if not good:
+            return None
+        if self.select == "random":
+            cost, seq = self.rng.choice(good)
+        else:
+            best = min(g[0] for g in good) if self.select == "min" else max(g[0] for g in good)
+            pool = [g for g in good if g[0] == best]
+            self.sel_events += 1
+            self.tie_events += 1 if len(pool) > 1 else 0
+            cost, seq = self.rng.choice(pool)
+        for v, side in seq:
+            self.st = split(self.st, v, side, self.nid, self.inherit)
+            self.nid += 1
+        self.cost_total += cost
+        return depth
+
+    def extend(self):
+        """转化：出现新的状态性质（k 增加），不改变任何已有取值。"""
+        added = 0
+        while not self.is_consistent():
+            self.st.k += 1
+            added += 1
+            if added > 50:
+                raise RuntimeError("转化失败：k 已连续增加 50 仍不自洽（检查配额 alpha 与约束图是否无解；可提高 k 上限或放宽 alpha）")
+        return added
+
+    def dissolve(self):
+        """消散：关系解体（连同其约束），不删除部分。先找最少的解体方案(1~3条)。"""
+        rels = self.st.edges()
+        for r in (1, 2, 3):
+            cand = []
+            for c in itertools.combinations(rels, r):
+                g = self.st.copy()
+                for a, b in c:
+                    g.rel[a].discard(b)
+                    g.rel[b].discard(a)
+                    g.cons.discard(edge(a, b))
+                    g.xrel.discard(edge(a, b))
+                if consistent(g):
+                    cand.append(c)
+            if cand:
+                for a, b in self.rng.choice(cand):
+                    self.st.rel[a].discard(b)
+                    self.st.rel[b].discard(a)
+                    self.st.cons.discard(edge(a, b))
+                    g.xrel.discard(edge(a, b))
+                return r
+        removed = 0
+        while not consistent(self.st):
+            rels_now = self.st.edges()
+            if not rels_now:
+                raise RuntimeError("消散无法恢复自洽：关系已全部解体，但整体配额仍不可行")
+            a, b = self.rng.choice(rels_now)
+            self.st.rel[a].discard(b)
+            self.st.rel[b].discard(a)
+            self.st.cons.discard(edge(a, b))
+            self.st.xrel.discard(edge(a, b))
+            removed += 1
+        return removed
+
+def reorganize(self):
+        if self.policy == "重组优先":
+            d = self.try_resplit()
+            if d:
+                self.resolved += 1
+                return f"重组(再分化{d}次)"
+            self.extend()
+            self.forced += 1
+            return "转化(重组不可行)" if self.max_depth == 1 else "转化(有限搜索未找到可行重组)"
+        if self.policy == "转化":
+            self.extend()
+            return "转化"
+        if self.policy == "消散":
+            return f"消散(解体{self.dissolve()}条关系)"
+        raise ValueError(self.policy)
+
+    # ----- 一步：变 -> 自洽筛选 -> 失稳时的响应 -----
+    def step(self):
+        self.change()
+        before = self.st.snapshot()
+        ok = self.is_consistent()
+        assert self.st.snapshot() == before, "自洽判定修改了状态：筛选者越权"
+        if ok:
+            return None
+        was_acyclic = is_forest(list(self.st.rel), self.st.edges())
+        if self.st.alpha >= 1.0 and not self.use_balance:
+            assert not is_forest(list(self.st.rel), sorted(self.st.cons)), "无配额时森林不应失稳"
+        out = self.reorganize()
+        assert self.is_consistent(), "响应之后仍不自洽"
+        self.log.append(dict(outcome=out, was_acyclic=was_acyclic))
+        return out
+
+
+def run(seed, steps, **kw):
+    w = World(seed, **kw)
+    for _ in range(steps):
+        w.step()
+    return w
+
+
+# ------------------------------------------------------------------ 自检
+def _ever(steps, seeds, **kw):
+    ws = [run(s, steps, **kw) for s in range(seeds)]
+    return ws, sum(1 for w in ws if w.log)
+
+
+def selftest():
+    print("== 单元检验 ==")
+    assert [quota(n, 0.5) for n in range(2, 8)] == [1, 2, 2, 3, 3, 4]
+    tri = State(2)
+    tri.rel = {0: {1, 2}, 1: {0, 2}, 2: {0, 1}}
+    tri.cons = {(0, 1), (0, 2), (1, 2)}
+    assert not consistent(tri)
+    tri.k = 3
+    assert consistent(tri) and chromatic_number(tri) == 3
+    print("  配额取整、自洽判定、色数：通过")
+
+    w = World(0)
+    assert len(w.st.rel) == 1 and consistent(w.st)
+    w.change()
+    assert len(w.st.rel) == 2 and consistent(w.st)
+    print("  起点：1 个无差异部分，一次变后 2 个部分，自洽：通过")
+
+    try:
+        World(0, alpha=0.4)
+        raise AssertionError("应当拒绝过小的 alpha")
+    except ValueError:
+        pass
+    w = World(0, alpha=0.5)
+    w.st.alpha = 0.4
+    w.st.rel = {i: set() for i in range(5)}
+    try:
+        w.dissolve()
+        raise AssertionError("应当显式失败")
+    except RuntimeError:
+        pass
+    print("  初始化检查与消散的显式失败路径：通过")
+
+    st = State(2)
+    st.rel = {0: {1}, 1: {0}}
+    st.cons = {(0, 1)}
+    st.xrel = {(0, 1)}
+    g = split(st, 1, {0: 0}, 2, True)
+    assert not consistent(g) and chromatic_number(g) == 3
+    for v, side in candidates(g, True):
+        assert not consistent(split(g, v, side, 3, True))
+    print("  整体约束不可分摊的最小例子（三角形，一次再分化修复不了）：通过")
+
+    print("\n== 回归：可分摊模式（inherit=False）应复现 v2 的验收数字 ==")
+    _off = dict(use_synergy=False, use_density=False, use_balance=False)
+    _, e = _ever(14, 150, alpha=1.0, p_link=0.0, inherit=False, **_off)
+    assert e == 0
+    print("  A2 无配额、无跨谱系连接：0/150 失稳")
+    got = [_ever(14, 150, alpha=a, p_link=0.0, inherit=False, **_off)[1] for a in (0.6, 0.55, 0.5)]
+    assert got == [8, 28, 133], got
+    print("  A3 只有配额 alpha=0.6/0.55/0.5：", got, "（v2：8 / 28 / 133）")
+    got = [_ever(14, 150, alpha=1.0, p_link=0.4, q_link=q, inherit=False, **_off)[1] for q in (0.0, 0.5, 1.0)]
+    assert got == [0, 134, 148], got
+    print("  A4 q_link=0/0.5/1.0：", got, "（v2：0 / 134 / 148）")
+    _, e = _ever(14, 150, alpha=0.55, p_link=0.4, q_link=1.0, inherit=False, **_off)
+    assert e == 148, e
+    print("  A5 配额与跨谱系关系并存：", e, "/150（v2：148）")
+
+    print("\n== 对照：仅 p_link 通道（三形式关，inherit=True）==")
+    ws, e = _ever(14, 100, alpha=1.0, p_link=0.2, q_link=1.0,
+                  use_synergy=False, use_density=False, use_balance=False)
+    forced_runs = sum(1 for w in ws if w.forced)
+    mean_k = sum(w.st.k for w in ws) / len(ws)
+    print(f"  p_link=0.2、三形式关：被迫转化 {forced_runs}/100，末态 k 均值 {mean_k:.2f}（历史对照：80/100，3.32）")
+    assert 65 <= forced_runs <= 95 and 2.9 <= mean_k <= 3.8
+    ws0, _ = _ever(14, 100, alpha=0.5, p_link=0.0,
+                   use_synergy=False, use_density=False, use_balance=False)
+    assert sum(w.forced for w in ws0) == 0
+    print("  只有配额（没有整体关系、三形式关）：被迫转化 0 次（重组足够，数量冲突不引发质变）")
+
+    print("\n== 选择原则（三形式关，p_link=0.2，80 个种子）==")
+    cost = {}
+    for sel in ("random", "min", "max"):
+        ws, _ = _ever(14, 80, alpha=1.0, p_link=0.2, q_link=1.0, select=sel,
+                      use_synergy=False, use_density=False, use_balance=False)
+        res = sum(w.resolved for w in ws)
+        cost[sel] = sum(w.cost_total for w in ws) / max(1, res)
+        ties = sum(w.tie_events for w in ws)
+        sels = sum(w.sel_events for w in ws)
+        tie_s = f"{ties / sels:.0%}" if sels else "--"
+        print(f"  {sel:<6} 每次重组的平均改动 {cost[sel]:.2f}，并列比例 {tie_s}")
+    assert cost["min"] <= cost["random"] <= cost["max"] + 1e-9
+
+    print("\n== A 验收（选项B）：三形式主通道 + p_link=0 规模驱动质变 ==")
+    base_forced = 0
+    for s in range(24):
+        w = World(s, alpha=1.0, p_link=0.0, q_link=1.0, inherit=True, max_resplit_depth=1,
+                  use_synergy=False, use_density=False, use_balance=False)
+        while len(w.st.rel) < 24:
+            w.step()
+        if w.forced:
+            base_forced += 1
+    print(f"  对照（三形式关, p=0, n→24）: 转化运行 {base_forced}/24")
+    assert base_forced <= 2, base_forced
+
+    cps = [6, 10, 14, 18, 24]
+    seeds_a = 24
+    rates = {cp: 0 for cp in cps}
+    mean_ks = {cp: 0.0 for cp in cps}
+    for s in range(seeds_a):
+        w = World(s, alpha=1.0, p_link=0.0, q_link=1.0, inherit=True, max_resplit_depth=1,
+                  use_synergy=True, use_density=True, use_balance=False,
+                  star_m=5, dens_theta=0.35, dens_min_size=6)
+        seen = set()
+        while len(w.st.rel) < max(cps):
+            w.step()
+            n = len(w.st.rel)
+            for cp in cps:
+                if n >= cp and cp not in seen:
+                    seen.add(cp)
+                    if w.forced:
+                        rates[cp] += 1
+                    mean_ks[cp] += w.st.k
+        for cp in cps:
+            if cp not in seen:
+                if w.forced:
+                    rates[cp] += 1
+                mean_ks[cp] += w.st.k
+    print("  三形式主通道 p_link=0 (m=5, θ=0.35):")
+    prev = -1.0
+    for cp in cps:
+        r = rates[cp] / seeds_a
+        mk = mean_ks[cp] / seeds_a
+        print(f"    n={cp}: 转化 {rates[cp]}/{seeds_a} ({r:.0%}), 平均 k {mk:.2f}")
+        if prev >= 0:
+            assert r + 0.15 >= prev, (cp, r, prev)
+        prev = r
+    r24 = rates[24] / seeds_a
+    assert r24 >= 0.35, (r24, "末端转化过低，主通道整体压力不足")
+    print(f"  通过：p_link=0 主通道末端转化率 {r24:.0%} ≥ 35%，且随 n 大致不降")
+
+
+    print("\n== B 验收：滞后 R(3) / A_stub 对照 ==")
+    trials_t = [hysteresis_trial(s, p_link=0.55, target_k=6, max_n=48, inherit=True,
+                                 prefer_xrel=True) for s in range(8)]
+    multi_t = [t for t in trials_t if t["k_peak"] >= 3]
+    assert len(multi_t) >= 5, f"建压不足: only {len(multi_t)}/8 with k_peak>=3"
+    R3s = [t["R3"] for t in multi_t]
+    Ast = [t["A_stub"] for t in multi_t]
+    mean_R3 = sum(R3s) / len(R3s)
+    mean_Ast = sum(Ast) / len(Ast)
+    mean_kp = sum(t["k_peak"] for t in multi_t) / len(multi_t)
+    print(f"  inherit=True  p=0.55: k_peak>=3 的样本 {len(multi_t)}/8，"
+          f"k_peak均值 {mean_kp:.2f}，R(3)均值 {mean_R3:.2f}，A_stub均值 {mean_Ast:.3f}")
+    assert mean_R3 >= 0.40, mean_R3
+    assert mean_Ast > 0, mean_Ast
+    assert all(a > -0.05 for a in Ast), Ast
+
+    trials_f = [hysteresis_trial(s, p_link=0.55, target_k=6, max_n=48, inherit=False,
+                                 prefer_xrel=True) for s in range(8)]
+    multi_f = [t for t in trials_f if t["k_peak"] >= 3]
+    mean_kf = sum(t["k_peak"] for t in trials_f) / len(trials_f)
+    print(f"  inherit=False p=0.55: k_peak>=3 的样本 {len(multi_f)}/8，k_peak均值 {mean_kf:.2f}")
+    assert len(multi_f) <= 3, len(multi_f)
+
+    trials_rnd = [hysteresis_trial(s, p_link=0.55, target_k=6, max_n=48, inherit=True,
+                                   prefer_xrel=False) for s in range(6)]
+    multi_r = [t for t in trials_rnd if t["k_peak"] >= 3 and t["R3"] is not None]
+    if multi_r and multi_t:
+        mean_R3r = sum(t["R3"] for t in multi_r) / len(multi_r)
+        print(f"  prefer_xrel=False: R(3)均值 {mean_R3r:.2f}（对照 prefer_xrel=True {mean_R3:.2f}）")
+        assert mean_R3r >= 0.25, mean_R3r
+
+    print(f"  通过：不可分摊下 R(3)≈{mean_R3:.2f}≥0.40 且 A_stub>0；"
+          f"可分摊对照少有 k_peak≥3")
+
+
+    print("\n== C 验收：Δτ_cycle 多循环累加 ==")
+    runs = [multi_cycle_tau(s, n_cycles=3, p_link=0.55, max_n_per_cycle=30,
+                            inherit=True, metric="R3") for s in range(6)]
+    sums = [r["sum_tau"] for r in runs]
+    mean_sum = sum(sums) / len(sums)
+    mean_c = []
+    for i in range(3):
+        mean_c.append(sum(r["cycles"][i]["dtau"] for r in runs) / len(runs))
+    print(f"  inherit=True  p=0.55, 3 循环: sum_τ 均值 {mean_sum:.2f}；"
+          f"各循环 Δτ 均值 {[round(x,2) for x in mean_c]}")
+    assert mean_sum >= 0.45, mean_sum
+    assert all(x >= 0.0 for x in sums), sums
+    positive_later = sum(1 for r in runs if r["cycles"][1]["dtau"] + r["cycles"][2]["dtau"] > 0.05)
+    assert positive_later >= 3, positive_later
+
+    rev = [multi_cycle_tau(s, n_cycles=2, p_link=0.0, max_n_per_cycle=18,
+                           inherit=False, metric="R3") for s in range(6)]
+    mean_rev = sum(r["sum_tau"] for r in rev) / len(rev)
+    print(f"  可逆极限 inherit=False p=0: sum_τ 均值 {mean_rev:.3f}")
+    assert mean_rev <= 0.15, mean_rev
+
+    print(f"  通过：高压不可分摊 sum_τ≈{mean_sum:.2f}≥0.45 且后续循环可贡献；"
+          f"可逆极限 sum_τ≈{mean_rev:.3f}≤0.15")
+
+
+    print("\n== D 验收：整体延续 + 扰动稳定性 ==")
+    conts = [continuity_trial(s, steps=12, p_link=0.3) for s in range(8)]
+    rate = sum(c["step_same"] for c in conts) / sum(c["step_total"] for c in conts)
+    diss_ok = sum(1 for c in conts if c["after_dissolve"]["root_ok"]
+                  and c["after_dissolve"]["subset_ok"])
+    print(f"  延续：逐步 same_whole 比例 {rate:.0%}；强消散后根+部分保留 {diss_ok}/8")
+    assert rate >= 0.75, rate
+    assert diss_ok == 8, diss_ok
+
+    grades = {k: [] for k in ("edge_del", "alpha", "edge_add")}
+    for kind in grades:
+        for s in range(8):
+            grades[kind].append(perturbation_trial(s, kind, grow_steps=10, p_link=0.35))
+    for kind, trials in grades.items():
+        from collections import Counter
+        cnt = Counter(t["grade"] for t in trials)
+        unre = cnt.get("未恢复", 0)
+        print(f"  扰动 {kind}: {dict(cnt)}；未恢复 {unre}/8")
+        assert unre <= 3, (kind, unre)
+    all_t = [t for ts in grades.values() for t in ts]
+    unre_all = sum(1 for t in all_t if t["grade"] == "未恢复")
+    assert unre_all <= 8, unre_all
+    print(f"  通过：延续比例 {rate:.0%}≥75%；三类扰动未恢复合计 {unre_all}/24 ≤8")
+
+    print("\n所有自检通过。")
+
+
+
+
+
+# ==================================================================
+# 实验平台子命令（第 17 节）
+# ==================================================================
+
+def cmd_scale(args):
+    """规模扫描：整体约束不可分摊下，连接强度与规模对被迫转化的影响。
+    --whole：开启第20节三形式（星形+密度+均匀），用于验收 p_link=0 仍能规模驱动质变。"""
+    whole = getattr(args, "whole", False)
+    p_links = [float(x) for x in args.p_links.split(",")]
+    checkpoints = [int(x) for x in args.checkpoints.split(",")]
+    seeds = args.seeds
+    tag = "三形式全开" if whole else "仅 inherit/xrel(p_link)"
+    print(f"== 规模扫描（inherit=True，α=1.0，q_link=1，{tag}）==")
+    print(f"  p_link ∈ {p_links}，检查点 n ∈ {checkpoints}，种子数 {seeds}")
+    print(f"  重组 = 一次再分化；whole={whole}（星形 m=5 / 密度 θ=0.35 / 均匀 s=1）\n")
+
+    forced_ratio = {p: {} for p in p_links}
+    mean_k = {p: {} for p in p_links}
+    wkw = dict(use_synergy=whole, use_density=whole, use_balance=whole) if whole else {}
+
+    for p in p_links:
+        print(f"--- p_link={p} ---")
+        max_n = max(checkpoints)
+        records = []
+        for s in range(seeds):
+            w = World(s, alpha=1.0, p_link=p, q_link=1.0, inherit=True,
+                      max_resplit_depth=1, policy="重组优先", **wkw)
+            forced_cum = 0
+            check_idx = 0
+            seed_rec = {}
+            while len(w.st.rel) < max_n and check_idx < len(checkpoints):
+                w.step()
+                n_now = len(w.st.rel)
+                forced_cum = w.forced
+                while check_idx < len(checkpoints) and n_now >= checkpoints[check_idx]:
+                    cp = checkpoints[check_idx]
+                    seed_rec[cp] = (forced_cum > 0, w.st.k)
+                    check_idx += 1
+            while check_idx < len(checkpoints):
+                cp = checkpoints[check_idx]
+                seed_rec[cp] = (forced_cum > 0, w.st.k)
+                check_idx += 1
+            records.append(seed_rec)
+
+        for cp in checkpoints:
+            forced_count = sum(1 for rec in records if rec.get(cp, (False, 2))[0])
+            ks = [rec.get(cp, (False, 2))[1] for rec in records]
+            ratio = forced_count / seeds
+            mk = sum(ks) / seeds
+            forced_ratio[p][cp] = ratio
+            mean_k[p][cp] = mk
+            print(f"  n={cp:>3}: 被迫转化比例 {ratio:6.1%}，平均 k {mk:.2f}")
+
+    print("\n被迫转化比例（到达规模 n 时至少发生过一次）")
+    hdr = "  p\\n" + "".join(f"{cp:>8}" for cp in checkpoints)
+    print(hdr)
+    for p in p_links:
+        print(f"  {p:>4.2f}" + "".join(f"{forced_ratio[p][cp]:>8.0%}" for cp in checkpoints))
+    if whole and 0.0 in p_links:
+        last = max(checkpoints)
+        r = forced_ratio[0.0][last]
+        print(f"\n[验收] p_link=0 全开，n={last} 转化比例={r:.0%}（目标：随 n 上升且末端显著 > 0）")
+    print("\n规模扫描完成。")
+
+
+
+def cmd_budget(args):
+    """预算扫描 E1：限制每个部分被重组再分化的次数 b。"""
+    print("== 预算扫描 E1（重组 = 一次再分化，枚举完备）==")
+    print(f"  预算 b ∈ {args.budgets}\n")
+
+    budgets = []
+    for x in args.budgets.split(","):
+        x = x.strip()
+        budgets.append(None if x.lower() in ("none", "inf", "无限") else int(x))
+
+    class BudgetWorld(World):
+        def __init__(self, seed, b=None, **kw):
+            super().__init__(seed, **kw)
+            self.b = b
+            self.budget = {0: b}
+
+        def change(self):
+            old = self.nid
+            super().change()
+            for v in range(old, self.nid):
+                self.budget[v] = self.b
+
+        def try_resplit(self):
+            good = []
+            for v, side in candidates(self.st, self.inherit):
+                if self.b is not None and self.budget.get(v, 0) is not None and self.budget.get(v, 0) < 1:
+                    continue
+                if consistent(split(self.st, v, side, self.nid, self.inherit)):
+                    good.append((split_cost(self.st, v, side, self.inherit), [(v, side)]))
+            if not good and self.max_depth >= 2:
+                lv1 = list(candidates(self.st, self.inherit))
+                self.rng.shuffle(lv1)
+                checks = 0
+                for v, side in lv1:
+                    if self.b is not None and self.budget.get(v, 0) is not None and self.budget.get(v, 0) < 1:
+                        continue
+                    g1 = split(self.st, v, side, self.nid, self.inherit)
+                    c1 = split_cost(self.st, v, side, self.inherit)
+                    lv2 = list(candidates(g1, self.inherit))
+                    self.rng.shuffle(lv2)
+                    for v2, side2 in lv2:
+                        checks += 1
+                        if consistent(split(g1, v2, side2, self.nid + 1, self.inherit)):
+                            good.append((c1 + split_cost(g1, v2, side2, self.inherit),
+                                         [(v, side), (v2, side2)]))
+                        if checks > self.cap or len(good) >= 10:
+                            break
+                    if checks > self.cap or len(good) >= 10:
+                        break
+            if not good:
+                return None
+            if self.select == "random":
+                cost, seq = self.rng.choice(good)
+            else:
+                best = min(g[0] for g in good) if self.select == "min" else max(g[0] for g in good)
+                pool = [g for g in good if g[0] == best]
+                cost, seq = self.rng.choice(pool)
+            for v, side in seq:
+                self.st = split(self.st, v, side, self.nid, self.inherit)
+                self.nid += 1
+                if self.b is not None and v in self.budget and self.budget[v] is not None:
+                    self.budget[v] -= 1
+            self.cost_total += cost
+            return 1 if len(seq) == 1 else 2
+
+    def run_scene(title, steps, seeds, **kw):
+        print(f"  {title}")
+        print(f"    {'b':>6}  {'运行数':>6}  {'被迫转化运行':>14}  {'转化次数':>8}  {'重组修复':>8}  {'末态k':>8}")
+        for b in budgets:
+            ws = []
+            for s in range(seeds):
+                w = BudgetWorld(s, b=b, max_resplit_depth=1, policy="重组优先", **kw)
+                for _ in range(steps):
+                    w.step()
+                ws.append(w)
+            forced_runs = sum(1 for w in ws if w.forced)
+            total_forced = sum(w.forced for w in ws)
+            total_resolved = sum(w.resolved for w in ws)
+            mean_k = sum(w.st.k for w in ws) / seeds
+            b_str = "无限" if b is None else str(b)
+            print(f"    {b_str:>6}  {seeds:>6}  {forced_runs:>8}/{seeds:<5}  {total_forced:>8}  "
+                  f"{total_resolved:>8}  {mean_k:>8.2f}")
+        print()
+
+    run_scene("场景 S1：只有整体配额 α=0.5，p_link=0，inherit=True", 14, 100,
+              alpha=0.5, p_link=0.0, q_link=1.0, inherit=True)
+    run_scene("场景 S2：α=0.55，p_link=0.25，q_link=1，inherit=True", 12, 60,
+              alpha=0.55, p_link=0.25, q_link=1.0, inherit=True)
+    print("预算扫描完成。")
+
+def cmd_burst(args):
+    """E3 检查间隔：每做 B 次变才做一次自洽筛选。"""
+    print("== E3 检查间隔（变快于筛选时转化是否被迫）==")
+    print(f"  α=1.0，p_link={args.p_link}，q_link=1，inherit=True，总变次数={args.steps}，种子={args.seeds}\n")
+    print(f"  {'B':>4}  {'检查次数':>8}  {'失稳/运行':>10}  {'重组修复':>8}  {'被迫转化':>8}  "
+          f"{'出现转化的运行':>14}  {'末态k':>8}")
+
+    Bs = [int(x) for x in args.B_list.split(",")]
+    for B in Bs:
+        n_checks = args.steps // B
+        ws = []
+        for s in range(args.seeds):
+            w = World(s, alpha=1.0, p_link=args.p_link, q_link=1.0, inherit=True,
+                      max_resplit_depth=1, policy="重组优先")
+            for _ in range(n_checks):
+                for _ in range(B):
+                    w.change()
+                if not consistent(w.st):
+                    w.reorganize()
+                    assert consistent(w.st)
+            ws.append(w)
+        res = sum(w.resolved for w in ws)
+        frc = sum(w.forced for w in ws)
+        rf = sum(1 for w in ws if w.forced)
+        mean_k = sum(w.st.k for w in ws) / args.seeds
+        mean_unst = sum(w.resolved + w.forced for w in ws) / args.seeds
+        print(f"  {B:>4}  {n_checks:>8}  {mean_unst:>10.2f}  {res:>8}  {frc:>8}  "
+              f"{rf:>8}/{args.seeds:<4}  {mean_k:>8.2f}")
+    print("\nE3 完成。")
+
+
+def cmd_construct(args):
+    """E2 构造性检验：不限次数的再分化能否在 k=2 下修复（可分摊模式）。"""
+    print("== E2 构造性检验（可分摊模式，目标 k=2）==")
+    print("  方法：对给定约束图做平衡定向 + 路径拆分，使所有环变偶数长，再用 split 逐步执行并验证。\n")
+
+    def make_complete(n):
+        st = State(2, 1.0)
+        st.rel = {i: set() for i in range(n)}
+        st.cons = set()
+        for i in range(n):
+            for j in range(i + 1, n):
+                e = edge(i, j)
+                st.rel[i].add(j)
+                st.rel[j].add(i)
+                st.cons.add(e)
+        return st
+
+    def make_random(n, p, seed=0):
+        rng = random.Random(seed)
+        st = State(2, 1.0)
+        st.rel = {i: set() for i in range(n)}
+        st.cons = set()
+        for i in range(n):
+            for j in range(i + 1, n):
+                if rng.random() < p:
+                    e = edge(i, j)
+                    st.rel[i].add(j)
+                    st.rel[j].add(i)
+                    st.cons.add(e)
+        return st
+
+    def balanced_orientation(nodes, edges):
+        """使每个点出度与入度至多差 1。"""
+        from collections import defaultdict
+        adj = defaultdict(list)
+        for a, b in edges:
+            adj[a].append(b)
+            adj[b].append(a)
+        orient = []
+        used = set()
+        for start in nodes:
+            while True:
+                unused = [v for v in adj[start] if edge(start, v) not in used]
+                if not unused:
+                    break
+                path = [start]
+                cur = start
+                while True:
+                    nxts = [v for v in adj[cur] if edge(cur, v) not in used]
+                    if not nxts:
+                        break
+                    nxt = nxts[0]
+                    used.add(edge(cur, nxt))
+                    orient.append((cur, nxt))
+                    cur = nxt
+                    path.append(cur)
+                    if cur == start and len(path) > 1:
+                        break
+                if cur != start:
+                    break
+        return orient
+
+    def try_repair_to_k2(st, max_splits=200):
+        """贪心：反复一次再分化直到 consistent 或次数用尽。可分摊。"""
+        nid = max(st.rel) + 1 if st.rel else 0
+        splits = 0
+        st = st.copy()
+        st.k = 2
+        st.alpha = 1.0
+        while not consistent(st) and splits < max_splits:
+            found = False
+            for v, side in candidates(st, inherit=False):
+                g = split(st, v, side, nid, inherit=False)
+                if consistent(g):
+                    st = g
+                    nid += 1
+                    splits += 1
+                    found = True
+                    break
+            if not found:
+                cands = list(candidates(st, inherit=False))
+                if not cands:
+                    break
+                v, side = cands[0]
+                st = split(st, v, side, nid, inherit=False)
+                nid += 1
+                splits += 1
+        return consistent(st), splits, st.k
+
+    graphs = []
+    for n in range(4, 8):
+        graphs.append((f"K{n}", make_complete(n)))
+    graphs.append(("G(8,0.7)", make_random(8, 0.7, seed=1)))
+    graphs.append(("G(9,0.6)", make_random(9, 0.6, seed=2)))
+
+    print(f"  {'图':<12} {'部分数':>6} {'初始色数':>8} {'再分化次数':>10} {'k=2自洽':>10}")
+    all_ok = True
+    for name, st in graphs:
+        chi = chromatic_number(st)
+        ok, splits, final_k = try_repair_to_k2(st)
+        print(f"  {name:<12} {len(st.rel):>6} {chi:>8} {splits:>10} {'是' if ok else '否':>10}")
+        if not ok:
+            all_ok = False
+    print()
+    if all_ok:
+        print("  全部通过：不限次数再分化可在 k=2 下修复（可分摊模式）。")
+    else:
+        print("  部分失败：构造/贪心修复未在上限内完成。")
+    print("E2 完成。")
+
+
+def cmd_select(args):
+    """选择原则对比（第 14 节）。"""
+    print("== 选择原则对比（inherit=True）==")
+    print(f"  p_link={args.p_link}，步数={args.steps}，种子={args.seeds}\n")
+    print(f"  {'选择':<8} {'失稳/运行':>10} {'被迫转化':>8} {'末态k':>8} {'平均改动':>10} {'并列比例':>10}")
+    for sel in ("random", "min", "max"):
+        ws = []
+        for s in range(args.seeds):
+            w = World(s, alpha=1.0, p_link=args.p_link, q_link=1.0, inherit=True,
+                      select=sel, max_resplit_depth=1, policy="重组优先")
+            for _ in range(args.steps):
+                w.step()
+            ws.append(w)
+        mean_unst = sum(len(w.log) for w in ws) / args.seeds
+        total_forced = sum(w.forced for w in ws)
+        mean_k = sum(w.st.k for w in ws) / args.seeds
+        res = sum(w.resolved for w in ws)
+        avg_cost = sum(w.cost_total for w in ws) / max(1, res)
+        ties = sum(w.tie_events for w in ws)
+        sels = sum(w.sel_events for w in ws)
+        tie_s = f"{ties / sels:.0%}" if sels else "--"
+        print(f"  {sel:<8} {mean_unst:>10.2f} {total_forced:>8} {mean_k:>8.2f} {avg_cost:>10.2f} {tie_s:>10}")
+    print("\n选择原则对比完成。")
+
+
+def cmd_x1(args):
+    """X1 对照：可分摊 vs 不可分摊。"""
+    print("== X1 对照：可分摊 vs 不可分摊 ==")
+    print(f"  步数={args.steps}，种子={args.seeds}\n")
+    scenes = [
+        ("只有配额 α=0.5，p_link=0", dict(alpha=0.5, p_link=0.0, q_link=1.0)),
+        ("整体关系 p_link=0.2", dict(alpha=1.0, p_link=0.2, q_link=1.0)),
+        ("整体关系 p_link=0.6", dict(alpha=1.0, p_link=0.6, q_link=1.0)),
+    ]
+    print(f"  {'场景':<28} {'整体约束':<10} {'失稳/运行':>10} {'重组':>6} {'转化':>6} "
+          f"{'转化运行':>8} {'末态k':>8}")
+    for title, kw in scenes:
+        for inherit, label in ((False, "可分摊"), (True, "不可分摊")):
+            ws = []
+            for s in range(args.seeds):
+                w = World(s, inherit=inherit, max_resplit_depth=1, policy="重组优先", **kw)
+                for _ in range(args.steps):
+                    w.step()
+                ws.append(w)
+            mean_unst = sum(w.resolved + w.forced for w in ws) / args.seeds
+            res = sum(w.resolved for w in ws)
+            frc = sum(w.forced for w in ws)
+            rf = sum(1 for w in ws if w.forced)
+            mean_k = sum(w.st.k for w in ws) / args.seeds
+            print(f"  {title:<28} {label:<10} {mean_unst:>10.2f} {res:>6} {frc:>6} "
+                  f"{rf:>4}/{args.seeds:<3} {mean_k:>8.2f}")
+    print("\nX1 完成。")
+
+
+
+def cmd_whole(args):
+    """第20节：整体约束三形式对照实验（使用 World 正式开关）。"""
+    print("== 整体约束三形式（标定：星形 m=5，密度 θ=0.35 |C|≥6 只升新边，均匀 s=1）==")
+    print(f"  steps={args.steps}, seeds={args.seeds}, p_link={args.p_link}\n")
+    configs = [
+        ("基线", dict(use_synergy=False, use_density=False, use_balance=False)),
+        ("+星形", dict(use_synergy=True, use_density=False, use_balance=False)),
+        ("+密度", dict(use_synergy=False, use_density=True, use_balance=False)),
+        ("+均匀", dict(use_synergy=False, use_density=False, use_balance=True)),
+        ("全开", dict(use_synergy=True, use_density=True, use_balance=True)),
+    ]
+    print(f"  {'配置':<8} {'转化运行':>10} {'末态k':>8} {'|xrel|':>8}")
+    for title, flags in configs:
+        fr = ks = xs = 0
+        for s in range(args.seeds):
+            w = World(s, alpha=1.0, p_link=args.p_link, q_link=1.0, inherit=True,
+                      max_resplit_depth=1, policy="重组优先", **flags)
+            for _ in range(args.steps):
+                w.step()
+            fr += 1 if w.forced else 0
+            ks += w.st.k
+            xs += len(w.st.xrel)
+        print(f"  {title:<8} {fr:>6}/{args.seeds:<3} {ks/args.seeds:>8.2f} {xs/args.seeds:>8.1f}")
+    print("\n整体约束实验完成。")
+
+
+
+def cmd_hysteresis(args):
+    """第19节：滞后序参量 R(κ) / A_stub 对照。"""
+    print("== 滞后序参量（建压 → 消散 → R(3)/R(2)/A_stub）==")
+    print(f"  p_link={args.p_link}, target_k={args.target_k}, max_n={args.max_n}, "
+          f"seeds={args.seeds}, frac={args.frac}\n")
+    rows = []
+    for inherit in (True, False):
+        for prefer in (True, False):
+            label = f"inherit={'T' if inherit else 'F'} xrel优先={'Y' if prefer else 'N'}"
+            trials = [
+                hysteresis_trial(s, p_link=args.p_link, target_k=args.target_k,
+                                 max_n=args.max_n, frac=args.frac,
+                                 inherit=inherit, prefer_xrel=prefer)
+                for s in range(args.seeds)
+            ]
+            multi = [t for t in trials if t["k_peak"] >= 3]
+            if multi:
+                r3 = sum(t["R3"] for t in multi) / len(multi)
+                r2 = sum(t["R2"] for t in multi) / len(multi)
+                ast = sum(t["A_stub"] for t in multi) / len(multi)
+                kp = sum(t["k_peak"] for t in multi) / len(multi)
+            else:
+                r3 = r2 = ast = kp = float("nan")
+            n_multi = len(multi)
+            print(f"  {label}: k_peak>=3 样本 {n_multi}/{args.seeds}, "
+                  f"k_peak均值 {kp:.2f}, R(3) {r3:.2f}, R(2) {r2:.2f}, A_stub {ast:.3f}")
+            rows.append((label, n_multi, kp, r3, r2, ast))
+    print("\n滞后实验完成。")
+
+
+
+def cmd_tau(args):
+    """第19节：多循环 Δτ_cycle 累加。"""
+    print("== 多循环 Δτ_cycle（metric=%s）==" % args.metric)
+    print(f"  p_link={args.p_link}, cycles={args.cycles}, max_n_per_cycle={args.max_n_per_cycle}, "
+          f"seeds={args.seeds}, inherit默认对照\n")
+    for inherit, lab in ((True, "不可分摊"), (False, "可分摊")):
+        runs = [
+            multi_cycle_tau(s, n_cycles=args.cycles, p_link=args.p_link,
+                            max_n_per_cycle=args.max_n_per_cycle, inherit=inherit,
+                            metric=args.metric)
+            for s in range(args.seeds)
+        ]
+        mean_sum = sum(r["sum_tau"] for r in runs) / args.seeds
+        print(f"  [{lab}] sum_τ 均值 {mean_sum:.3f}")
+        for i in range(args.cycles):
+            md = sum(r["cycles"][i]["dtau"] for r in runs) / args.seeds
+            mk = sum(r["cycles"][i]["k_peak"] for r in runs) / args.seeds
+            print(f"    循环{i+1}: Δτ均值 {md:.3f}, k_peak均值 {mk:.2f}")
+    print("\n多循环时间增量实验完成。")
+
+
+
+def cmd_stability(args):
+    """整体延续与扰动稳定性（验收 D）。"""
+    print("== 整体延续 ==")
+    conts = [continuity_trial(s, steps=args.steps, p_link=args.p_link) for s in range(args.seeds)]
+    rate = sum(c["step_same"] for c in conts) / max(1, sum(c["step_total"] for c in conts))
+    diss_ok = sum(1 for c in conts if c["after_dissolve"]["root_ok"] and c["after_dissolve"]["subset_ok"])
+    print(f"  逐步 same_whole 比例 {rate:.1%}（{args.seeds} 种子 × {args.steps} 步）")
+    print(f"  强消散后根部分+部分集合保留 {diss_ok}/{args.seeds}")
+
+    print("\n== 扰动稳定性 ==")
+    print(f"  {'类型':<10} {'强稳定':>8} {'等价稳定':>8} {'弱稳定':>8} {'未恢复':>8}")
+    for kind in ("edge_del", "alpha", "edge_add"):
+        trials = [perturbation_trial(s, kind, grow_steps=args.grow,
+                                     p_link=args.p_link) for s in range(args.seeds)]
+        from collections import Counter
+        cnt = Counter(t["grade"] for t in trials)
+        print(f"  {kind:<10} {cnt.get('强稳定',0):>8} {cnt.get('等价稳定',0):>8} "
+              f"{cnt.get('弱稳定',0):>8} {cnt.get('未恢复',0):>8}")
+    print("\n稳定性实验完成。")
+
+
+
+
+def cmd_locality(args):
+    """有效距离与局域性探测（规格 v0.1）：分通道直方图 + 零模型 + 盒计数 N(r)。"""
+    import locality_probe as lp
+    from collections import defaultdict
+
+    print("== 局域性探测（规格 v0.1）==")
+    print(f"  seeds={args.seeds}, steps={args.steps}, p_link={args.p_link}, "
+          f"whole={args.whole}, theta={args.theta}, w_xrel={args.w_xrel}\n")
+
+    channel_vals = defaultdict(list)
+    all_Nr = []
+    null_means = []
+
+    for s in range(args.seeds):
+        w = World(
+            s, alpha=1.0, p_link=args.p_link, q_link=1.0, inherit=True,
+            max_resplit_depth=1, policy="重组优先",
+            use_synergy=args.whole, use_density=args.whole, use_balance=False,
+        )
+        for _ in range(args.steps):
+            n_ev = len(w.edge_events)
+            w.step()
+            new_ev = w.edge_events[n_ev:]
+            if not new_ev:
+                continue
+            snap = lp.probe_snapshot(w, theta=args.theta, w_xrel=args.w_xrel)
+            D = snap["D"]
+            for ch, a, b in new_ev:
+                d = D.get((a, b), D.get((b, a)))
+                if d is None:
+                    continue
+                channel_vals[ch].append(d)
+
+        snap = lp.probe_snapshot(w, theta=args.theta, w_xrel=args.w_xrel)
+        radii = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
+        Nr = lp.median_ball_N(snap["V"], snap["D"], radii)
+        all_Nr.append(Nr)
+
+        n_edges = max(1, len(w.st.edges()) // 10)
+        null = lp.null_model_distances(
+            snap["V"], n_edges, snap["D"], w.rng, samples=args.null_samples)
+        if null:
+            null_means.append(sum(null) / len(null))
+
+    print("  【检验 A】分通道新边 / 升格 的 D_eff（均值 ± 样本数）")
+    print(f"  {'通道':<8} {'均值':>8} {'中位':>8} {'n':>6}")
+    for ch in ("C-R1", "C-pl", "C-syn", "C-den", "C-oth"):
+        xs = channel_vals.get(ch, [])
+        if not xs:
+            print(f"  {ch:<8} {'—':>8} {'—':>8} {0:>6}")
+            continue
+        xs_s = sorted(xs)
+        mean = sum(xs) / len(xs)
+        med = xs_s[len(xs_s) // 2]
+        print(f"  {ch:<8} {mean:>8.4f} {med:>8.4f} {len(xs):>6}")
+
+    if null_means:
+        print(f"  零模型 D_eff 均值（跨种子）: {sum(null_means)/len(null_means):.4f}")
+
+    print("\n  【检验 B】中位球 N(r)（跨种子平均）")
+    if all_Nr:
+        radii = sorted(all_Nr[0].keys())
+        print(f"  {'r':>6} {'N(r)':>8}")
+        avg = {}
+        for r in radii:
+            avg[r] = sum(nr[r] for nr in all_Nr) / len(all_Nr)
+            print(f"  {r:>6.2f} {avg[r]:>8.2f}")
+        fit = lp.fit_log_log_dimension(avg, args.r_min, args.r_max)
+        if fit:
+            print(f"  拟合窗 [{args.r_min}, {args.r_max}]: "
+                  f"d_eff≈{fit['d_eff']:.3f}, R²={fit['R2']:.3f}, n={fit['n_points']}")
+        else:
+            print(f"  拟合窗 [{args.r_min}, {args.r_max}]: 点不足，未拟合")
+    print("\n  说明：C-R1 近距为规则定义；C-pl 若近零模型则无额外局域偏好；"
+          "d_eff 拟合须声明窗，不预写 2 或 3。")
+    print("局域性探测完成。")
+
+
+def cmd_defaults(args=None):
+    """选项 B 默认 + 子命令一览（工程小项：CLI 说明）。"""
+    try:
+        from exp_meta import defaults_option_b
+        d = defaults_option_b()
+    except Exception:
+        d = dict(inherit=True, p_link=0.0, use_synergy=True, use_density=True, star_m=5, dens_theta=0.35)
+    print("== 选项 B 默认参数 ==")
+    for k, v in d.items():
+        print(f"  {k}: {v}")
+    print("\n== 常用子命令 ==")
+    print("  (无子命令)           运行完整自检 A–D")
+    print("  scale                规模扫描")
+    print("  whole                三形式对照")
+    print("  hysteresis           T2：R(3)/A_stub")
+    print("  tau                  T2：多循环 Δτ")
+    print("  stability            D：延续与扰动")
+    print("  locality             有效维/局域性（默认 p_link=0、三形式开）")
+    print("  defaults             本说明")
+    print("  meta-example         实验 meta JSON 示例")
+    print("\n口径：理论口径一页纸_v1.0.md ；R(3)/Δτ 与 d_eff 分线。")
+
+
+def cmd_meta_example(args=None):
+    from exp_meta import make_meta, defaults_option_b
+    import json
+    meta = make_meta("example_run", defaults_option_b(), model_path="mother_field_model.py")
+    print(json.dumps({"meta": meta, "result": {"note": "payload here"}}, ensure_ascii=False, indent=2))
+
+
+
+def main():
+
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="母场玩具模型 — 统一实验平台",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""子命令:
+  python3 mother_field_model.py                # 自检
+  python3 mother_field_model.py scale          # 规模扫描（第13节）
+  python3 mother_field_model.py budget         # 预算扫描 E1（第11节）
+  python3 mother_field_model.py burst          # 检查间隔 E3（第11节）
+  python3 mother_field_model.py construct      # 构造性检验 E2（第11节）
+  python3 mother_field_model.py select         # 选择原则对比（第14节）
+  python3 mother_field_model.py x1             # 可分摊 vs 不可分摊对照（第12节）
+""")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("scale", help="规模扫描")
+    p.add_argument("--p-links", default="0.05,0.1,0.2,0.4")
+    p.add_argument("--checkpoints", default="6,10,14,18,22,26,32,40")
+    p.add_argument("--seeds", type=int, default=60)
+    p.add_argument("--whole", action="store_true",
+                   help="开启第20节三形式（星形+密度+均匀），用于 p_link=0 验收")
+
+    p = sub.add_parser("budget", help="预算扫描 E1")
+    p.add_argument("--budgets", default="none,3,2,1,0")
+
+    p = sub.add_parser("burst", help="检查间隔 E3")
+    p.add_argument("--B-list", default="1,2,3,4,6")
+    p.add_argument("--steps", type=int, default=12)
+    p.add_argument("--seeds", type=int, default=60)
+    p.add_argument("--p-link", type=float, default=0.6)
+
+    p = sub.add_parser("construct", help="构造性检验 E2")
+
+    p = sub.add_parser("select", help="选择原则对比")
+    p.add_argument("--p-link", type=float, default=0.2)
+    p.add_argument("--steps", type=int, default=14)
+    p.add_argument("--seeds", type=int, default=80)
+
+    p = sub.add_parser("x1", help="可分摊 vs 不可分摊对照")
+    p.add_argument("--steps", type=int, default=14)
+    p.add_argument("--seeds", type=int, default=100)
+
+    p = sub.add_parser("whole", help="整体约束三形式对照（第20节）")
+    p.add_argument("--steps", type=int, default=14)
+    p.add_argument("--seeds", type=int, default=20)
+    p.add_argument("--p-link", type=float, default=0.0)
+
+    p = sub.add_parser("hysteresis", help="滞后序参量 R(3)/A_stub（第19节）")
+    p.add_argument("--p-link", type=float, default=0.55)
+    p.add_argument("--target-k", type=int, default=6)
+    p.add_argument("--max-n", type=int, default=48)
+    p.add_argument("--seeds", type=int, default=10)
+    p.add_argument("--frac", type=float, default=0.10)
+
+    p = sub.add_parser("tau", help="多循环 Δτ_cycle 累加（第19节对接）")
+    p.add_argument("--p-link", type=float, default=0.55)
+    p.add_argument("--cycles", type=int, default=3)
+    p.add_argument("--max-n-per-cycle", type=int, default=24)
+    p.add_argument("--seeds", type=int, default=8)
+    p.add_argument("--metric", choices=("R3", "A_stub"), default="R3")
+
+    p = sub.add_parser("stability", help="整体延续与扰动稳定性（验收 D）")
+    p.add_argument("--seeds", type=int, default=12)
+    p.add_argument("--steps", type=int, default=14)
+    p.add_argument("--grow", type=int, default=12)
+    p.add_argument("--p-link", type=float, default=0.3)
+
+    p = sub.add_parser("locality", help="有效距离与局域性探测（规格 v0.1；选项B默认三形式）")
+    p.add_argument("--seeds", type=int, default=8)
+    p.add_argument("--steps", type=int, default=16)
+    p.add_argument("--p-link", type=float, default=0.0, help="默认0（选项B）；可选增强")
+    p.add_argument("--whole", action="store_true", default=True, help="三形式（默认开）")
+    p.add_argument("--no-whole", action="store_false", dest="whole", help="关闭三形式")
+    p.add_argument("--theta", type=float, default=0.5, help="D_eff 中谱系权重")
+    p.add_argument("--w-xrel", type=float, default=1.0)
+    p.add_argument("--null-samples", type=int, default=80)
+    p.add_argument("--r-min", type=float, default=0.2)
+    p.add_argument("--r-max", type=float, default=0.6)
+
+    p = sub.add_parser("defaults", help="打印选项 B 默认参数与 CLI 子命令一览")
+    p = sub.add_parser("meta-example", help="打印实验 meta 字段示例（JSON）")
+
+    args = parser.parse_args()
+    if getattr(args, "cmd", None) == "defaults":
+        cmd_defaults(args)
+        return
+    if getattr(args, "cmd", None) == "meta-example":
+        cmd_meta_example(args)
+        return
+    dispatch = {
+        "scale": cmd_scale,
+        "budget": cmd_budget,
+        "burst": cmd_burst,
+        "construct": cmd_construct,
+        "select": cmd_select,
+        "x1": cmd_x1,
+        "whole": cmd_whole,
+        "hysteresis": cmd_hysteresis,
+        "tau": cmd_tau,
+        "stability": cmd_stability,
+        "locality": cmd_locality,
+    }
+    if args.cmd in dispatch:
+        dispatch[args.cmd](args)
+    else:
+        selftest()
+
+
+if __name__ == "__main__":
+    main()
